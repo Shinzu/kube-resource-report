@@ -538,7 +538,7 @@ def generate_report(
 
         for ns_pod, pod in summary["pods"].items():
             namespace = namespace_usage.get(
-                ns_pod[0],
+                (ns_pod[0], cluster_id),
                 {
                     "id": ns_pod[0],
                     "cost": 0,
@@ -546,7 +546,7 @@ def generate_report(
                     "pods": 0,
                     "requests": {},
                     "usage": {},
-                    "clusters": set(),
+                    "cluster": "",
                     "email": "",
                     "status": "",
                 },
@@ -559,8 +559,8 @@ def generate_report(
             namespace["cost"] += pod["cost"]
             namespace["slack_cost"] += pod.get("slack_cost", 0)
             namespace["pods"] += 1
-            namespace["clusters"].add(cluster_id)
-            namespace_usage[ns_pod[0]] = namespace
+            namespace["cluster"] = cluster_id
+            namespace_usage[(ns_pod[0], cluster_id)] = namespace
 
     if application_registry:
         resolve_application_ids(applications, teams, application_registry)
@@ -572,7 +572,7 @@ def generate_report(
 
     for cluster_id, summary in sorted(cluster_summaries.items()):
         for ns, ns_values in summary["namespaces"].items():
-            namespace = namespace_usage.get(ns)
+            namespace = namespace_usage.get((ns, cluster_id))
             if namespace:
                 namespace["email"] = ns_values["email"]
                 namespace["status"] = ns_values["status"]
