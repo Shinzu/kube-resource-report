@@ -26,6 +26,7 @@ NODE_LABEL_SPOT = "aws.amazon.com/spot"
 ONE_MEBI = 1024 ** 2
 ONE_GIBI = 1024 ** 3
 
+# we show costs per month by default as it leads to easily digestable numbers (for humans)
 AVG_DAYS_PER_MONTH = 30.4375
 HOURS_PER_DAY = 24
 HOURS_PER_MONTH = HOURS_PER_DAY * AVG_DAYS_PER_MONTH
@@ -63,7 +64,7 @@ def parse_resource(v):
 
 session = requests.Session()
 # set a friendly user agent for outgoing HTTP requests
-session.headers["User-Agent"] = "kube-resource-report/{}".format(__version__)
+session.headers["User-Agent"] = f"kube-resource-report/{__version__}"
 
 
 def request(cluster, path, **kwargs):
@@ -80,16 +81,37 @@ def request(cluster, path, **kwargs):
     )
 
 
+def json_default(obj):
+    if isinstance(obj, set):
+        return list(obj)
+    raise TypeError(obj)
+
+
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
 def query_cluster(
-    cluster, executor, system_namespaces, additional_cost_per_cluster, no_ingress_status
+    cluster, executor, system_namespaces, additional_cost_per_cluster, no_ingress_status, node_label
 ):
-    logger.info("Querying cluster {} ({})..".format(cluster.id, cluster.api_server_url))
+    logger.info(f"Querying cluster {cluster.id} ({cluster.api_server_url})..")
     pods = {}
     nodes = {}
+    namespaces = {}
+
+    response = request(cluster, "/api/v1/namespaces")
+    response.raise_for_status()
+
+    for item in response.json()["items"]:
+        email = None
+        namespace, status = item["metadata"]["name"], item["status"]["phase"]
+        if 'annotations' in item["metadata"]:
+            if 'email' in item["metadata"]["annotations"]:
+                email = item["metadata"]["annotations"]["email"]
+        namespaces[namespace] = {
+            "status": status,
+            "email": email,
+        }
 
     response = request(cluster, "/api/v1/nodes")
     response.raise_for_status()
@@ -148,6 +170,8 @@ def query_cluster(
                     logger.warning("Failed to query metrics: %s", e)
                 else:
                     raise
+            if response.ok:
+                break
         for item in response.json()["items"]:
             key = item["metadata"]["name"]
             node = nodes.get(key)
@@ -197,17 +221,18 @@ def query_cluster(
         "cluster": cluster,
         "nodes": nodes,
         "pods": pods,
+        "namespaces": namespaces,
         "user_pods": len([p for ns, p in pods if ns not in system_namespaces]),
         "master_nodes": node_count["master"],
-        "worker_nodes": node_count["worker"],
+        "worker_nodes": node_count[node_label],
         "kubelet_versions": set(
-            [n["kubelet_version"] for n in nodes.values() if n["role"] == "worker"]
+            [n["kubelet_version"] for n in nodes.values() if n["role"] == node_label]
         ),
         "worker_instance_types": set(
-            [n["instance_type"] for n in nodes.values() if n["role"] == "worker"]
+            [n["instance_type"] for n in nodes.values() if n["role"] == node_label]
         ),
         "worker_instance_is_spot": any(
-            [n["spot"] for n in nodes.values() if n["role"] == "worker"]
+            [n["spot"] for n in nodes.values() if n["role"] == node_label]
         ),
         "capacity": cluster_capacity,
         "allocatable": cluster_allocatable,
@@ -240,6 +265,8 @@ def query_cluster(
                     logger.warning("Failed to query metrics: %s", e)
                 else:
                     raise
+            if response.ok:
+                break
         for item in response.json()["items"]:
             key = (item["metadata"]["namespace"], item["metadata"]["name"])
             pod = pods.get(key)
@@ -273,9 +300,7 @@ def query_cluster(
                 ingress = [namespace, name, application, rule["host"], 0]
                 if not no_ingress_status:
                     futures[
-                        futures_session.get(
-                            "https://{}/".format(rule["host"]), timeout=5
-                        )
+                        futures_session.get(f"https://{rule['host']}/", timeout=5)
                     ] = ingress
                 cluster_summary["ingresses"].append(ingress)
 
@@ -304,6 +329,7 @@ def get_cluster_summaries(
     notifications: list,
     additional_cost_per_cluster: float,
     no_ingress_status: bool,
+    node_label: str,
 ):
     cluster_summaries = {}
 
@@ -334,6 +360,7 @@ def get_cluster_summaries(
                         system_namespaces,
                         additional_cost_per_cluster,
                         no_ingress_status,
+                        node_label,
                     )
                 ] = cluster
 
@@ -344,7 +371,7 @@ def get_cluster_summaries(
                 cluster_summaries[cluster.id] = summary
             except Exception as e:
                 notifications.append(
-                    ["error", "Failed to query cluster {}: {}".format(cluster.id, e)]
+                    ["error", f"Failed to query cluster {cluster.id}: {e}"]
                 )
                 logger.exception(e)
     return cluster_summaries
@@ -445,10 +472,15 @@ def generate_report(
     include_clusters,
     exclude_clusters,
     additional_cost_per_cluster,
+    pricing_file,
+    node_label,
 ):
     notifications = []
 
     output_path = Path(output_dir)
+
+    if pricing_file:
+        pricing.NODE_COSTS_MONTHLY = pricing.regenerate_cost_dict(pricing_file)
 
     start = datetime.datetime.utcnow()
 
@@ -473,9 +505,11 @@ def generate_report(
             notifications,
             additional_cost_per_cluster,
             no_ingress_status,
+            node_label,
         )
         teams = {}
         applications = {}
+        namespace_usage = {}
 
     total_allocatable = collections.defaultdict(int)
     total_requests = collections.defaultdict(int)
@@ -515,6 +549,32 @@ def generate_report(
             app["clusters"].add(cluster_id)
             applications[pod["application"]] = app
 
+        for ns_pod, pod in summary["pods"].items():
+            namespace = namespace_usage.get(
+                (ns_pod[0], cluster_id),
+                {
+                    "id": ns_pod[0],
+                    "cost": 0,
+                    "slack_cost": 0,
+                    "pods": 0,
+                    "requests": {},
+                    "usage": {},
+                    "cluster": "",
+                    "email": "",
+                    "status": "",
+                },
+            )
+            for r in "cpu", "memory":
+                namespace["requests"][r] = namespace["requests"].get(r, 0) + pod["requests"][r]
+                namespace["usage"][r] = namespace["usage"].get(r, 0) + pod.get("usage", {}).get(
+                    r, 0
+                )
+            namespace["cost"] += pod["cost"]
+            namespace["slack_cost"] += pod.get("slack_cost", 0)
+            namespace["pods"] += 1
+            namespace["cluster"] = cluster_id
+            namespace_usage[(ns_pod[0], cluster_id)] = namespace
+
     if application_registry:
         resolve_application_ids(applications, teams, application_registry)
 
@@ -523,6 +583,13 @@ def generate_report(
             app = applications.get(pod["application"])
             pod["team"] = app["team"]
 
+    for cluster_id, summary in sorted(cluster_summaries.items()):
+        for ns, ns_values in summary["namespaces"].items():
+            namespace = namespace_usage.get((ns, cluster_id))
+            if namespace:
+                namespace["email"] = ns_values["email"]
+                namespace["status"] = ns_values["status"]
+
     if not use_cache:
         with pickle_path.open("wb") as fd:
             pickle.dump(
@@ -530,6 +597,7 @@ def generate_report(
                     "cluster_summaries": cluster_summaries,
                     "teams": teams,
                     "applications": applications,
+                    "namespace_usage": namespace_usage,
                 },
                 fd,
             )
@@ -541,7 +609,7 @@ def generate_report(
             worker_instance_type = set()
             kubelet_version = set()
             for node in summary["nodes"].values():
-                if node["role"] == "worker":
+                if node["role"] == node_label:
                     worker_instance_type.add(node["instance_type"])
                 kubelet_version.add(node["kubelet_version"])
             fields = [
@@ -650,6 +718,7 @@ def generate_report(
         "cluster_summaries": cluster_summaries,
         "teams": teams,
         "applications": applications,
+        "namespace_usage": namespace_usage,
         "total_worker_nodes": sum(
             [s["worker_nodes"] for s in cluster_summaries.values()]
         ),
@@ -678,32 +747,69 @@ def generate_report(
     with (output_path / "metrics.json").open("w") as fd:
         json.dump(metrics, fd)
 
-    for page in ["index", "clusters", "ingresses", "teams", "applications", "pods"]:
-        file_name = "{}.html".format(page)
-        logger.info("Generating {}..".format(file_name))
+    for page in ["index", "clusters", "ingresses", "teams", "applications", "namespaces", "pods"]:
+        file_name = f"{page}.html"
+        logger.info(f"Generating {file_name}..")
         template = env.get_template(file_name)
         context["page"] = page
         template.stream(**context).dump(str(output_path / file_name))
 
     for cluster_id, summary in cluster_summaries.items():
         page = "clusters"
-        file_name = "cluster-{}.html".format(cluster_id)
-        logger.info("Generating {}..".format(file_name))
+        file_name = f"cluster-{cluster_id}.html"
+        logger.info(f"Generating {file_name}..")
         template = env.get_template("cluster.html")
         context["page"] = page
         context["cluster_id"] = cluster_id
         context["summary"] = summary
         template.stream(**context).dump(str(output_path / file_name))
 
+    with (output_path / "cluster-metrics.json").open("w") as fd:
+        json.dump(
+            {
+                cluster_id: {
+                    key: {
+                        k if isinstance(k, str) else '/'.join(k): v
+                        for k, v in value.items()
+                    } if hasattr(value, 'items') else value
+                    for key, value in summary.items()
+                    if key != 'cluster'
+                }
+                for cluster_id, summary in cluster_summaries.items()
+            },
+            fd,
+            default=json_default
+        )
+
     for team_id, team in teams.items():
         page = "teams"
-        file_name = "team-{}.html".format(team_id)
-        logger.info("Generating {}..".format(file_name))
+        file_name = f"team-{team_id}.html"
+        logger.info(f"Generating {file_name}..")
         template = env.get_template("team.html")
         context["page"] = page
         context["team_id"] = team_id
         context["team"] = team
         template.stream(**context).dump(str(output_path / file_name))
+
+    with (output_path / "team-metrics.json").open("w") as fd:
+        json.dump(
+            {
+                team_id: {
+                    **team,
+                    "application": {
+                        app_id: app
+                        for app_id, app in applications.items()
+                        if app["team"] == team_id
+                    }
+                }
+                for team_id, team in teams.items()
+            },
+            fd,
+            default=json_default
+        )
+
+    with (output_path / "application-metrics.json").open("w") as fd:
+        json.dump(applications, fd, default=json_default)
 
     assets_path = output_path / "assets"
     assets_path.mkdir(exist_ok=True)

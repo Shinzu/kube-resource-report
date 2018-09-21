@@ -26,6 +26,7 @@ def test_generate_report(tmpdir, monkeypatch):
         },
         "/api/v1/pods": {"items": []},
         "/apis/extensions/v1beta1/ingresses": {"items": []},
+        "/api/v1/namespaces": {"items": []},
     }
 
     monkeypatch.setattr(
@@ -45,5 +46,7 @@ def test_generate_report(tmpdir, monkeypatch):
         None,
         None,
         0,
+        None,
+        "worker"
     )
     assert len(cluster_summaries) == 1

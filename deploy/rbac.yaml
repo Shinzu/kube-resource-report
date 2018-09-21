@@ -10,17 +10,18 @@ metadata:
   name: kube-resource-report
 rules:
 - apiGroups: [""]
-  resources: ["nodes", "pods"]
+  resources: ["nodes", "pods", "namespaces"]
   verbs:
     - list
 - apiGroups: ["extensions"]
   resources: ["ingresses"]
   verbs:
     - list
-- apiGroups: ["metrics"]
+- apiGroups: ["metrics.k8s.io"]
   resources: ["nodes", "pods"]
   verbs:
     - get
+    - list
 - apiGroups: [""]
   resources: ["services/proxy"]
   resourceNames: ["heapster"]
