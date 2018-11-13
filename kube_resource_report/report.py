@@ -32,6 +32,7 @@ HOURS_PER_DAY = 24
 HOURS_PER_MONTH = HOURS_PER_DAY * AVG_DAYS_PER_MONTH
 
 FACTORS = {
+    "n": 1 / 1000000000,
     "m": 1 / 1000,
     "K": 1000,
     "M": 1000 ** 2,
@@ -190,8 +191,8 @@ def query_cluster(
     response = request(cluster, "/api/v1/pods")
     response.raise_for_status()
     for pod in response.json()["items"]:
-        if pod["status"].get("phase") in ("Succeeded", "Failed"):
-            # ignore completed pods
+        if pod["status"].get("phase") != "Running":
+            # ignore unschedulable/completed pods
             continue
         labels = pod["metadata"].get("labels", {})
         application = labels.get("application", labels.get("app", ""))
@@ -374,7 +375,9 @@ def get_cluster_summaries(
                     ["error", f"Failed to query cluster {cluster.id}: {e}"]
                 )
                 logger.exception(e)
-    return cluster_summaries
+
+    sorted_by_name = sorted(cluster_summaries.values(), key=lambda summary: summary["cluster"].name)
+    return {summary["cluster"].id: summary for summary in sorted_by_name}
 
 
 def resolve_application_ids(applications: dict, teams: dict, application_registry: str):
@@ -572,11 +575,19 @@ def generate_report(
             namespace["cost"] += pod["cost"]
             namespace["slack_cost"] += pod.get("slack_cost", 0)
             namespace["pods"] += 1
-            namespace["cluster"] = cluster_id
+            namespace["cluster"] = summary["cluster"]
             namespace_usage[(ns_pod[0], cluster_id)] = namespace
 
     if application_registry:
         resolve_application_ids(applications, teams, application_registry)
+
+    for team in teams.values():
+        def cluster_name(cluster_id):
+            try:
+                return cluster_summaries[cluster_id]["cluster"].name
+            except KeyError:
+                return None
+        team["clusters"] = sorted(team["clusters"], key=cluster_name)
 
     for cluster_id, summary in sorted(cluster_summaries.items()):
         for k, pod in summary["pods"].items():
@@ -601,6 +612,24 @@ def generate_report(
                 },
                 fd,
             )
+
+    logger.info("Writing namespaces.tsv..")
+    with (output_path / "namespaces.tsv").open("w") as csvfile:
+        writer = csv.writer(csvfile, delimiter="\t")
+        for cluster_id, namespace_item in sorted(namespace_usage.items()):
+            fields = [
+                namespace_item["id"],
+                namespace_item["status"],
+                namespace_item["cluster"],
+                namespace_item["pods"],
+                namespace_item["requests"]["cpu"],
+                namespace_item["requests"]["memory"],
+                round(namespace_item["usage"]["cpu"], 2),
+                round(namespace_item["usage"]["memory"], 2),
+                round(namespace_item["cost"], 2),
+                round(namespace_item["slack_cost"], 2)
+            ]
+            writer.writerow(fields)
 
     logger.info("Writing clusters.tsv..")
     with (output_path / "clusters.tsv").open("w") as csvfile:
